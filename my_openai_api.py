@@ -192,7 +192,7 @@ and provides basic information about each one such as the owner and availability
 
 
 @stream_with_context
-def stream_chat_generate(messages,temperature=1.0,top_p=0.8,):
+def stream_chat_generate(messages,temperature=1.0,top_p=0.8):
     delta = ChatDeltaSchema().dump(
             {"role": "assistant"})
     choice = ChatCompletionChunkChoiceSchema().dump(
@@ -267,7 +267,7 @@ def create_chat_completion():
 
     if create_chat_completion["stream"]:
         return current_app.response_class(
-            stream_chat_generate(create_chat_completion["messages"]),
+            stream_chat_generate(create_chat_completion["messages"],temperature=create_chat_completion["temperature"],top_p=create_chat_completion["top_p"]),
             mimetype="text/event-stream"
         )
     else:

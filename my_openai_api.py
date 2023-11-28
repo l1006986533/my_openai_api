@@ -18,24 +18,19 @@ from apispec_webframeworks.flask import FlaskPlugin
 
 class Transformers():
     def __init__(self, app=None, tokenizer=None, model=None):
-        self.chat = None
         if app is not None:
             self.init_app(app, tokenizer, model)
 
-    def init_app(self, app, tokenizer=None, model=None, chat=None):
+    def init_app(self, app, tokenizer=None, model=None):
         self.tokenizer = tokenizer
         self.model = model
-        if chat is None:
-            self.chat = model.chat
+        self.streamer = TextIteratorStreamer(self.tokenizer, skip_prompt=True)
 
 
 tfs = Transformers()
-base_tfs = Transformers()
-
 
 models_bp = Blueprint('Models', __name__, url_prefix='/v1/models')
 chat_bp = Blueprint('Chat', __name__, url_prefix='/v1/chat')
-completions_bp = Blueprint('Completions', __name__, url_prefix='/v1/completions')
 
 
 def sse(line, field="data"):
@@ -53,7 +48,6 @@ def create_app():
     CORS(app)
     app.register_blueprint(models_bp)
     app.register_blueprint(chat_bp)
-    app.register_blueprint(completions_bp)
 
     @app.after_request
     def after_request(resp):
@@ -75,14 +69,14 @@ def create_app():
     spec.components.security_scheme("bearer", bearer_scheme)
     template = spec.to_flasgger(
         app,
-        paths=[list_models, create_chat_completion, create_completion]
+        paths=[list_models, create_chat_completion]
     )
 
     app.config['SWAGGER'] = {"openapi": "3.0.2"}
     Swagger(app, template=template)
 
     # Init transformers
-    model_name = "./Baichuan2-13B-Chat-4bits"
+    model_name = "./Yi-34B-Chat-4bits"
     tokenizer = AutoTokenizer.from_pretrained(
             model_name, use_fast=False, trust_remote_code=True)
     model = AutoModelForCausalLM.from_pretrained(
@@ -90,7 +84,6 @@ def create_app():
     model.generation_config = GenerationConfig.from_pretrained(model_name)
 
     tfs.init_app(app, tokenizer, model)
-    base_tfs.init_app(app, tokenizer, model)
 
     return app
 
@@ -124,7 +117,7 @@ class CreateChatCompletionSchema(Schema):
     temperature = fields.Float(load_default=1.0, metadata={"example": 1.0})
     top_p = fields.Float(load_default=1.0, metadata={"example": 1.0})
     n = fields.Int(load_default=1, metadata={"example": 1})
-    max_tokens = fields.Int(load_default=None, metadata={"example": None})
+    max_tokens = fields.Int(load_default=1000, metadata={"example": 1000})
     stream = fields.Bool(load_default=False, example=False)
     presence_penalty = fields.Float(load_default=0.0, example=0.0)
     frequency_penalty = fields.Float(load_default=0.0, example=0.0)
@@ -174,46 +167,6 @@ class ChatCompletionChunkShema(Schema):
     model = fields.Str(metadata={"example": "gpt-3.5-turbo"})
     choices = fields.List(fields.Nested(ChatCompletionChunkChoiceSchema))
 
-
-class CreateCompletionSchema(Schema):
-    model = fields.Str(required=True, metadata={"example": "gpt-3.5-turbo"})
-    prompt = fields.Raw(metadata={"example": "Say this is a test"})
-    max_tokens = fields.Int(load_default=16, metadata={"example": 256})
-    temperature = fields.Float(load_default=1.0, metadata={"example": 1.0})
-    top_p = fields.Float(load_default=1.0, metadata={"example": 1.0})
-    n = fields.Int(load_default=1, metadata={"example": 1})
-    stream = fields.Bool(load_default=False, example=False)
-    logit_bias = fields.Dict(load_default=None, example={})
-    presence_penalty = fields.Float(load_default=0.0, example=0.0)
-    frequency_penalty = fields.Float(load_default=0.0, example=0.0)
-
-
-class CompletionChoiceSchema(Schema):
-    index = fields.Int(load_default=0, metadata={"example": 0})
-    text = fields.Str(required=True, metadata={"example": "登鹳雀楼->王之涣\n夜雨寄北->"})
-    logprobs = fields.Dict(load_default=None, metadata={"example": {}})
-    finish_reason = fields.Str(
-        validate=validate.OneOf(["stop", "length", "content_filter", "function_call"]),
-        metadata={"example": "stop"})
-
-
-class CompletionUsageSchema(Schema):
-    prompt_tokens = fields.Int(metadata={"example": 5})
-    completion_tokens = fields.Int(metadata={"example": 7})
-    total_tokens = fields.Int(metadata={"example": 12})
-
-
-class CompletionSchema(Schema):
-    id = fields.Str(
-        dump_default=lambda: uuid.uuid4().hex,
-        metadata={"example": "cmpl-uqkvlQyYK7bGYrRHQ0eXlWi7"})
-    object = fields.Constant("text_completion")
-    created = fields.Int(dump_default=lambda: int(time.time()), metadata={"example": 1695402567})
-    model = fields.Str(metadata={"example": "gpt-3.5-turbo"})
-    choices = fields.List(fields.Nested(CompletionChoiceSchema))
-    usage = fields.Nested(CompletionUsageSchema)
-
-
 @models_bp.route("")
 def list_models():
     """
@@ -239,7 +192,7 @@ and provides basic information about each one such as the owner and availability
 
 
 @stream_with_context
-def stream_chat_generate(messages):
+def stream_chat_generate(messages,temperature=1.0,top_p=0.8,):
     delta = ChatDeltaSchema().dump(
             {"role": "assistant"})
     choice = ChatCompletionChunkChoiceSchema().dump(
@@ -251,14 +204,15 @@ def stream_chat_generate(messages):
             "choices": [choice]})
     )
 
-    position = 0
-    for response in tfs.chat(
-            tfs.tokenizer,
-            messages,
-            stream=True):
-        content = response[position:]
+    input_ids = tfs.tokenizer.apply_chat_template(conversation=messages, tokenize=True, add_generation_prompt=True,
+                                          return_tensors='pt')
+    generation_kwargs = dict(input_ids=input_ids.to('cuda'), streamer=tfs.streamer, temperature=temperature, top_p=top_p)
+    thread = Thread(target=tfs.model.generate, kwargs=generation_kwargs)
+    thread.start()
+    for content in tfs.streamer:
         if not content:
             continue
+        content = content.replace('<|im_end|>', '\n')
         empty_cache()
         delta = ChatDeltaSchema().dump(
                 {"content": content})
@@ -270,7 +224,6 @@ def stream_chat_generate(messages):
                 "model": "gpt-3.5-turbo",
                 "choices": [choice]})
         )
-        position = len(response)
 
     choice = ChatCompletionChunkChoiceSchema().dump(
             {"index": 0, "delta": {}, "finish_reason": "stop"})
@@ -318,7 +271,10 @@ def create_chat_completion():
             mimetype="text/event-stream"
         )
     else:
-        response = tfs.chat(tfs.tokenizer, create_chat_completion["messages"])
+        input_ids = tfs.tokenizer.apply_chat_template(conversation=create_chat_completion["messages"], tokenize=True, add_generation_prompt=True,
+                                          return_tensors='pt')
+        output_ids = tfs.model.generate(input_ids.to('cuda'))
+        response = tfs.tokenizer.decode(output_ids[0][input_ids.shape[1]:], skip_special_tokens=True)
 
         message = ChatMessageSchema().dump(
                 {"role": "assistant", "content": response})
@@ -327,134 +283,6 @@ def create_chat_completion():
         return ChatCompletionSchema().dump({
             "model": "gpt-3.5-turbo",
             "choices": [choice]})
-
-
-@stream_with_context
-def stream_generate(prompts, **generate_kwargs):
-    finish_choices = []
-    for index, prompt in enumerate(prompts):
-        choice = CompletionChoiceSchema().dump(
-            {"index": index, "text": "\n\n", "logprobs": None, "finish_reason": None})
-
-        yield sse(
-            CompletionSchema().dump(
-                {"model": "gpt-3.5-turbo-instruct", "choices": [choice]})
-        )
-
-        inputs = base_tfs.tokenizer(prompt, padding=True, return_tensors='pt')
-        inputs = inputs.to(base_tfs.model.device)
-        streamer = TextIteratorStreamer(
-            base_tfs.tokenizer,
-            decode_kwargs={"skip_special_tokens": True})
-        Thread(
-            target=base_tfs.model.generate, kwargs=dict(
-                inputs, streamer=streamer,
-                repetition_penalty=1.1, **generate_kwargs)
-        ).start()
-
-        finish_reason = None
-        for text in streamer:
-            if not text:
-                continue
-            empty_cache()
-            if text.endswith(base_tfs.tokenizer.eos_token):
-                finish_reason = "stop"
-                break
-
-            choice = CompletionChoiceSchema().dump(
-                {"index": index, "text": text, "logprobs": None, "finish_reason": None})
-
-            yield sse(
-                CompletionSchema().dump(
-                    {"model": "gpt-3.5-turbo-instruct", "choices": [choice]})
-            )
-        else:
-            finish_reason = "length"
-            choice = CompletionChoiceSchema().dump(
-                {"index": index, "text": text, "logprobs": None, "finish_reason": finish_reason})
-            yield sse(
-                CompletionSchema().dump(
-                    {"model": "gpt-3.5-turbo-instruct", "choices": [choice]})
-            )
-
-        choice = CompletionChoiceSchema().dump(
-            {"index": index, "text": "", "logprobs": None, "finish_reason": finish_reason})
-        finish_choices.append(choice)
-
-    yield sse(
-        CompletionSchema().dump(
-            {"model": "gpt-3.5-turbo-instruct", "choices": finish_choices})
-    )
-
-    yield sse('[DONE]')
-
-
-@completions_bp.route("", methods=["POST"])
-def create_completion():
-    """Create completion
-    ---
-    post:
-      tags:
-        - Completions
-      description: Creates a completion for the provided prompt and parameters.
-      requestBody:
-        request: True
-        content:
-          application/json:
-            schema: CreateCompletionSchema
-      security:
-        - bearer: []
-      responses:
-        200:
-          description: Completion return
-          content:
-            application/json:
-              schema:
-                CompletionSchema
-    """
-    create_completion = CreateCompletionSchema().load(request.json)
-
-    prompt = create_completion["prompt"]
-    prompts = prompt if isinstance(prompt, list) else [prompt]
-
-    if create_completion["stream"]:
-        return current_app.response_class(
-            stream_generate(prompts, max_new_tokens=create_completion["max_tokens"]),
-            mimetype="text/event-stream"
-        )
-    else:
-        choices = []
-        prompt_tokens = 0
-        completion_tokens = 0
-        for index, prompt in enumerate(prompts):
-            inputs = base_tfs.tokenizer(prompt, return_tensors='pt')
-            inputs = inputs.to(base_tfs.model.device)
-            prompt_tokens += len(inputs["input_ids"][0])
-            pred = base_tfs.model.generate(
-                **inputs, max_new_tokens=create_completion["max_tokens"], repetition_penalty=1.1)
-
-            completion_tokens += len(pred.cpu()[0])
-            resp = base_tfs.tokenizer.decode(pred.cpu()[0], skip_special_tokens=False)
-
-            finish_reason = None
-            if resp.endswith(base_tfs.tokenizer.eos_token):
-                finish_reason = "stop"
-                resp = resp[:-len(base_tfs.tokenizer.eos_token)]
-            else:
-                finish_reason = "length"
-
-            choices.append(
-                CompletionChoiceSchema().dump(
-                    {"index": index, "text": resp, "logprobs": {}, "finish_reason": finish_reason})
-            )
-        usage = CompletionUsageSchema().dump({
-            "prompt_tokens": prompt_tokens,
-            "completion_tokens": completion_tokens,
-            "total_tokens": prompt_tokens+completion_tokens})
-
-        return CompletionSchema().dump(
-                {"model": "gpt-3.5-turbo-instruct", "choices": choices, "usage": usage})
-
 
 app = create_app()
 
@@ -468,4 +296,4 @@ if __name__ == '__main__':
     except Exception:
         pass
 
-    app.run(debug=False, host="0.0.0.0", port=5000)
+    app.run(debug=False, host="0.0.0.0", port=8081)
